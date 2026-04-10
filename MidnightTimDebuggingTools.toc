@@ -1,0 +1,10 @@
+## Interface: 120000
+## Title: MidnightTim Debugging Tools
+## Notes: Standalone polling-based debug recorder for Midnight 12.0 client research. Not part of MidnightSensei.
+## Author: Midnight - Thrall (US)
+## Version: 1.0.0
+## SavedVariables: MidnightTimDebugDB
+
+Utils.lua
+Core.lua
+UI.lua
