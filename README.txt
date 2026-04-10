@@ -125,63 +125,6 @@ Fields:
                        snapshot is taken immediately (correlates proc
                        fires with spell availability changes)
 
-SPELL IDs MARKED -- VERIFY
-Several IDs in the Devourer profile are sourced from MidnightSensei's
-spec database and wowdb.com data. They should be confirmed in-game:
-
-  1217605   Void Metamorphosis
-  1221167   Collapsing Star        (combatGated — may not appear at login)
-  1226019   Reap
-  1234195   Void Nova
-  473728    Void Ray
-  1245412   Voidblade
-  1238855   Mastery: Monster Within
-  1227619   Shattered Souls
-
-Use /mtdt spellinfo <id> to check each one before your first session.
-Use /mtdt snapshot to see their usability state live.
-
-
-DEVOURER DH — WHAT TO LOOK FOR
--------------------------------
-Key questions this addon helps answer:
-
-1. Which spells are visible at load?
-   Check spellbookAtStart in the session record.
-   Compare against watchedSpells list.
-
-2. Which spells only appear in combat?
-   Look for NEW_SPELL_APPEARED events where inCombat = true.
-   Check newSpellsDiscovered in the session summary.
-
-3. Which spells appear after a proc?
-   Look for PROC_TRIGGER_SNAPSHOT events — these fire when a
-   procTriggerAura is added and include a full usability snapshot.
-   Compare usability before and after the proc.
-
-4. Are "should not appear" spells showing up?
-   The watchedSpells list includes Metamorphosis (Havoc), Eye Beam,
-   The Hunt, and Immolation Aura as negative checks.
-   If SPELL_KNOWN_CHANGED fires for these, something is wrong.
-
-5. Is Collapsing Star truly combatGated?
-   It should NOT appear in spellbookAtStart.
-   It SHOULD appear as NEW_SPELL_APPEARED when Void Metamorphosis is active.
-
-
-RECOMMENDED WORKFLOW
---------------------
-1. Log in on your Devourer DH.
-2. Run /mtdt spellinfo on each VERIFY spell ID listed above.
-3. Run /mtdt snapshot to see baseline usability.
-4. Enter combat (addon auto-starts a session).
-5. Trigger Void Metamorphosis.
-6. Cast Collapsing Star if available.
-7. Leave combat (session auto-stops and saves).
-8. Run /mtdt sessions to confirm it was saved.
-9. Run /mtdt export recent.
-10. Log out, open the SavedVariables file, inspect lastExportCSV.
-    Or inspect the raw sessions[] table directly — it's readable Lua.
 
 
 PERFORMANCE NOTES
