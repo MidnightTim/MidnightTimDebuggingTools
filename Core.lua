@@ -114,8 +114,17 @@ Core.WATCH_PROFILES = {
 }
 
 -- Active profile used during recording. Nil = record everything generically.
--- Set via /mtdt profile devourer (etc.)
-Core.activeProfile = Core.WATCH_PROFILES.DEVOURER_DH
+-- Auto-selected on login by DetectProfile(). Can be overridden with /mtdt profile.
+-- Starts nil so any class that doesn't match a profile gets generic recording.
+Core.activeProfile = nil
+
+-- Forward declaration: DetectProfile is defined near OnLogin below but called
+-- from the slash handler which is defined earlier in the file.
+local DetectProfile
+
+-- Forward declarations for profile build/restore functions defined near OnLogin.
+local BuildProfileFromDump
+local RestoreGeneratedProfiles
 
 --------------------------------------------------------------------------------
 -- Internal state -- never persisted directly, rebuilt each session
@@ -947,11 +956,24 @@ local function HandleSlash(msg)
     ----------------------------------------------------------------------------
     elseif cmd == "talents" then
         local talents = U().SnapshotTalents()
-        U().Print(string.format("-- Talents (%d active) --", #talents))
-        for _, t in ipairs(talents) do
-            U().Print(string.format("  node=%s spell=%-7s rank=%d  %s",
-                tostring(t.nodeID), tostring(t.spellID), t.rank or 1,
-                t.name or "?"))
+        if #talents == 0 then
+            U().Print("No talents found -- talent tree may not be loaded yet.")
+        else
+            local lines = { "spellID,name,rank,nodeID" }
+            for _, t in ipairs(talents) do
+                table.insert(lines, string.format("%d,%s,%d,%s",
+                    t.spellID or 0,
+                    U().Str(t.name or "unknown"),
+                    t.rank or 1,
+                    U().Str(t.nodeID)))
+            end
+            local text = table.concat(lines, "\n")
+            local ui2 = MidnightTimDebug and MidnightTimDebug.UI
+            if ui2 and ui2.ShowExport then
+                ui2.ShowExport(text)
+            else
+                U().Print(string.format("Talents (%d) -- open UI to copy", #talents))
+            end
         end
 
     ----------------------------------------------------------------------------
@@ -963,12 +985,30 @@ local function HandleSlash(msg)
         elseif p == "NONE" or p == "GENERIC" then
             Core.activeProfile = nil
             U().Print("Active profile cleared (generic recording).")
+        elseif p == "CLEAR" then
+            -- Remove all generated profiles from memory and SavedVariables
+            local db = GetDB()
+            db.generatedProfiles = {}
+            for key in pairs(Core.WATCH_PROFILES) do
+                if key:find("^GENERATED_") then
+                    Core.WATCH_PROFILES[key] = nil
+                end
+            end
+            Core.activeProfile = nil
+            U().Print("All generated profiles cleared. Using generic recording.")
+        elseif p == "AUTO" or p == "" then
+            local detected = DetectProfile()
+            if detected then
+                U().Print("Auto-detected profile: " .. detected.name)
+            else
+                U().Print("No profile matched your class/spec -- using generic recording.")
+            end
         else
-            U().Print("Known profiles: devourer, none")
+            U().Print("Usage: /mtdt profile auto | devourer | none")
             if Core.activeProfile then
                 U().Print("Current: " .. Core.activeProfile.name)
             else
-                U().Print("Current: generic")
+                U().Print("Current: generic (all spells/auras captured, no watch list)")
             end
         end
 
@@ -999,6 +1039,149 @@ local function HandleSlash(msg)
     elseif cmd == "hide" then
         local ui = MidnightTimDebug and MidnightTimDebug.UI
         if ui and ui.Hide then ui.Hide() end
+
+    ----------------------------------------------------------------------------
+    elseif cmd == "dumpspells" or cmd == "buildprofile" then
+        -- "buildprofile" is the primary user-facing command (spell dump + talents + profile build).
+        -- "dumpspells" remains as an alias for backwards compatibility.
+        local out = {}
+        local i   = 1
+        local bank = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player
+        while true do
+            local ok, info = pcall(C_SpellBook.GetSpellBookItemInfo, i, bank)
+            if not ok or not info then break end
+            local name    = U().Sanitize(info.name)
+            local spellID = U().Sanitize(info.actionID or info.spellID)
+            if name and spellID then
+                table.insert(out, {
+                    index     = i,
+                    name      = name,
+                    subName   = U().Sanitize(info.subName) or "",
+                    spellType = tostring(info.itemType or ""),
+                    spellID   = spellID,
+                })
+            end
+            i = i + 1
+            if i > 1024 then break end
+        end
+        table.sort(out, function(a, b)
+            if a.name == b.name then return a.spellID < b.spellID end
+            return a.name < b.name
+        end)
+
+        -- Capture class/spec
+        local cs        = U().SnapshotClassSpec()
+        local classID   = cs.classID
+        local specIdx   = cs.specIdx
+        local className = cs.className or "Unknown"
+        local specName  = cs.specName  or "Unknown"
+
+        -- Capture talents at the same time
+        local talents = U().SnapshotTalents()
+
+        -- Store everything
+        local db = GetDB()
+        db.spellDump      = out
+        db.spellDumpTime  = U().WallClock()
+        db.talentDump     = talents
+        db.spellDumpClass = {
+            classID   = classID,  specIdx   = specIdx,
+            className = className, specName  = specName,
+        }
+
+        U().Print(string.format(
+            "Build Profile: %d spells + %d talents captured for %s %s.",
+            #out, #talents, specName, className))
+
+        -- Build profile and activate
+        local profile = BuildProfileFromDump(out, classID, specIdx, className, specName)
+
+        if profile then
+            -- Open UI then show reload prompt
+            local ui2 = MidnightTimDebug and MidnightTimDebug.UI
+            if ui2 then
+                if ui2.Show then ui2.Show() end
+                C_Timer.After(0.1, function()
+                    if ui2.ShowReloadPrompt then ui2.ShowReloadPrompt() end
+                end)
+            end
+        else
+            U().Print("Profile build failed -- check class/spec detection.")
+        end
+
+    ----------------------------------------------------------------------------
+    elseif cmd == "spelllist" then
+        -- Show raw spell dump in the copy-paste export box for independent troubleshooting.
+        local db = GetDB()
+        local dump = db.spellDump
+        if not dump or #dump == 0 then
+            U().Print("No spell dump found. Run /mtdt buildprofile first.")
+        else
+            local lines = { "spellID,name,subName,spellType" }
+            for _, e in ipairs(dump) do
+                table.insert(lines, string.format("%d,%s,%s,%s",
+                    e.spellID or 0,
+                    U().Str(e.name),
+                    U().Str(e.subName),
+                    U().Str(e.spellType)))
+            end
+            local text = table.concat(lines, "\n")
+            local ui2 = MidnightTimDebug and MidnightTimDebug.UI
+            if ui2 and ui2.ShowExport then
+                ui2.ShowExport(text)
+            else
+                U().Print("Spell list: " .. #dump .. " spells (open UI to copy)")
+            end
+        end
+
+    ----------------------------------------------------------------------------
+    elseif cmd == "talentlist" then
+        -- Show raw talent dump in the copy-paste export box for independent troubleshooting.
+        local db = GetDB()
+        local dump = db.talentDump or U().SnapshotTalents()
+        if not dump or #dump == 0 then
+            U().Print("No talent data found. Run /mtdt buildprofile first.")
+        else
+            local lines = { "spellID,name,rank,nodeID" }
+            for _, t in ipairs(dump) do
+                table.insert(lines, string.format("%d,%s,%d,%s",
+                    t.spellID or 0,
+                    U().Str(t.name),
+                    t.rank or 1,
+                    U().Str(t.nodeID)))
+            end
+            local text = table.concat(lines, "\n")
+            local ui2 = MidnightTimDebug and MidnightTimDebug.UI
+            if ui2 and ui2.ShowExport then
+                ui2.ShowExport(text)
+            else
+                U().Print("Talent list: " .. #dump .. " talents (open UI to copy)")
+            end
+        end
+
+    ----------------------------------------------------------------------------
+    elseif cmd == "debug" and args == "profile" then
+        -- Show exactly what classID/specIdx are being read and what profiles exist
+        local classID = U().Safe(function()
+            local _, _, id = UnitClass("player") ; return id
+        end)
+        local specIdx = U().Safe(GetSpecialization)
+        local cs      = U().SnapshotClassSpec()
+        U().Print(string.format("classID=%s  specIdx=%s  className=%s  specName=%s",
+            tostring(classID), tostring(specIdx),
+            tostring(cs.className), tostring(cs.specName)))
+        U().Print("WATCH_PROFILES keys:")
+        for k, p in pairs(Core.WATCH_PROFILES) do
+            U().Print(string.format("  %s  classID=%s  specIdx=%s",
+                k, tostring(p.classID), tostring(p.specIdx)))
+        end
+        local db = GetDB()
+        U().Print("generatedProfiles keys:")
+        for k, p in pairs(db.generatedProfiles or {}) do
+            U().Print(string.format("  %s  classID=%s  specIdx=%s",
+                k, tostring(p.classID), tostring(p.specIdx)))
+        end
+        U().Print("activeProfile: " .. (Core.activeProfile and Core.activeProfile.name or "nil"))
 
     ----------------------------------------------------------------------------
     elseif cmd == "apicheck" then
@@ -1108,25 +1291,35 @@ local function HandleSlash(msg)
         end
 
     ----------------------------------------------------------------------------
-    elseif cmd == "help" or cmd == "" then
+    elseif cmd == "help" then
         U().Print("--- " .. Core.DISPLAY .. " v" .. Core.VERSION .. " ---")
+        U().Print("/mtdt                  -- open/close debug panel")
         U().Print("/mtdt start            -- start recording (manual)")
         U().Print("/mtdt stop             -- stop recording")
         U().Print("/mtdt status           -- show recorder state")
-        U().Print("/mtdt reset            -- discard active session + clear all saved data")
+        U().Print("/mtdt reset            -- discard session + clear all data")
         U().Print("/mtdt sessions         -- list last 10 saved sessions")
-        U().Print("/mtdt export           -- export most recent session to CSV")
-        U().Print("/mtdt export recent    -- same as above")
+        U().Print("/mtdt export recent    -- export most recent session to CSV")
         U().Print("/mtdt export last10    -- export last 10 sessions")
-        U().Print("/mtdt export all       -- export all saved sessions")
-        U().Print("/mtdt snapshot         -- live spell usability for active profile")
+        U().Print("/mtdt export all       -- export all sessions")
+        U().Print("/mtdt snapshot         -- live spell usability")
         U().Print("/mtdt auras            -- print current player auras")
         U().Print("/mtdt talents          -- print active talents")
         U().Print("/mtdt spellinfo <id>   -- full debug info for one spell ID")
-        U().Print("/mtdt profile <name>   -- set watch profile (devourer, none)")
+        U().Print("/mtdt profile auto     -- re-detect profile from class/spec")
+        U().Print("/mtdt profile devourer -- force Devourer DH profile")
+        U().Print("/mtdt profile none     -- generic mode (no watch list)")
         U().Print("/mtdt interval <sec>   -- set poll interval (0.05-1.0)")
+        U().Print("/mtdt apicheck         -- probe which APIs are available")
+        U().Print("/mtdt buildprofile     -- dump spells + talents, build profile, prompt reload")
+        U().Print("/mtdt dumpspells       -- alias for buildprofile")
 
     ----------------------------------------------------------------------------
+    elseif cmd == "" then
+        -- Bare /mtdt opens the UI
+        local ui = MidnightTimDebug and MidnightTimDebug.UI
+        if ui and ui.Toggle then ui.Toggle() end
+
     else
         U().Print("Unknown command: " .. tostring(cmd) .. ". Try /mtdt help")
     end
@@ -1174,6 +1367,135 @@ end
 --------------------------------------------------------------------------------
 local initDone = false
 
+--------------------------------------------------------------------------------
+-- Generated profile persistence
+-- Profiles built from spell dumps are stored in SavedVariables so they survive
+-- reloads. On login they are re-injected into Core.WATCH_PROFILES before
+-- DetectProfile() runs, so auto-detect picks them up immediately.
+--------------------------------------------------------------------------------
+BuildProfileFromDump = function(spellList, classID, specIdx, className, specName)
+    if not spellList or #spellList == 0 then
+        U().Print("No spells in dump -- run /mtdt dumpspells first.")
+        return nil
+    end
+
+    local profileKey  = string.format("GENERATED_%d_%d", classID or 0, specIdx or 0)
+    local profileName = string.format("%s %s (generated)", specName or "?", className or "?")
+
+    -- watchedSpells: all castable spells from the dump (exclude passives)
+    local watchedSpells  = {}
+    local watchedAuras   = {}
+    local seenIDs        = {}
+
+    for _, entry in ipairs(spellList) do
+        local id = entry.spellID
+        if id and id > 0 and not seenIDs[id] then
+            seenIDs[id] = true
+            -- itemType "SPELL" or nil = castable; "PASSIVE" = skip for watched
+            local t = tostring(entry.spellType or "")
+            if not t:find("PASSIVE") and not t:find("passive") then
+                table.insert(watchedSpells, id)
+            end
+            -- Seed watchedAuras with same IDs -- aura spellIDs often match castable IDs
+            -- The session will tell us which ones actually produce auras
+            table.insert(watchedAuras, id)
+        end
+    end
+
+    local profile = {
+        name             = profileName,
+        classID          = classID,
+        specIdx          = specIdx,
+        watchedSpells    = watchedSpells,
+        watchedAuras     = watchedAuras,
+        procTriggerAuras = {},    -- populated manually after analysing session data
+        generated        = true,  -- flag: built from dump, not hand-authored
+        generatedAt      = U().WallClock(),
+    }
+
+    -- Inject into live WATCH_PROFILES table
+    Core.WATCH_PROFILES[profileKey] = profile
+
+    -- Persist to SavedVariables so it survives reloads
+    local db = GetDB()
+    db.generatedProfiles = db.generatedProfiles or {}
+    db.generatedProfiles[profileKey] = {
+        name             = profile.name,
+        classID          = classID,
+        specIdx          = specIdx,
+        watchedSpells    = watchedSpells,
+        watchedAuras     = watchedAuras,
+        procTriggerAuras = {},
+        generated        = true,
+        generatedAt      = profile.generatedAt,
+    }
+
+    U().Print(string.format(
+        "Profile '%s' built: %d watched spells. Activating now.",
+        profileName, #watchedSpells))
+
+    -- Activate immediately
+    Core.activeProfile = profile
+    return profile
+end
+
+-- Called from OnLogin after EnsureDB() -- re-injects any previously generated
+-- profiles from SavedVariables back into Core.WATCH_PROFILES so DetectProfile()
+-- can find them.
+RestoreGeneratedProfiles = function()
+    local db = GetDB()
+    if not db.generatedProfiles then return end
+    local count = 0
+    for key, p in pairs(db.generatedProfiles) do
+        -- Always overwrite -- ensures only one entry per key even if
+        -- BuildProfileFromDump already injected a live version this session
+        Core.WATCH_PROFILES[key] = p
+        count = count + 1
+    end
+    if count > 0 then
+        U().Print(string.format("[Profile] Restored %d generated profile(s).", count))
+    end
+end
+-- Reads classID and specIdx from the WoW API and matches against all defined
+-- watch profiles. Falls back to nil (generic) if no profile matches.
+-- Generic mode still captures everything: spellbook changes, auras, casts,
+-- usability, resources, talents -- just without a watched spell list.
+-- Can be called again after a spec change via /mtdt profile auto.
+--------------------------------------------------------------------------------
+DetectProfile = function()
+    local classID = U().Safe(function()
+        local _, _, id = UnitClass("player") ; return id
+    end)
+    local specIdx = U().Safe(GetSpecialization)
+
+    if not classID then
+        Core.activeProfile = nil
+        return nil
+    end
+
+    -- Exact match: classID + specIdx
+    for _, profile in pairs(Core.WATCH_PROFILES) do
+        if profile.classID == classID and profile.specIdx == specIdx then
+            Core.activeProfile = profile
+            return profile
+        end
+    end
+
+    -- specIdx nil fallback: API not ready yet at login
+    if specIdx == nil then
+        for _, profile in pairs(Core.WATCH_PROFILES) do
+            if profile.classID == classID then
+                Core.activeProfile = profile
+                return profile
+            end
+        end
+    end
+
+    -- No match -- generic mode
+    Core.activeProfile = nil
+    return nil
+end
+
 local function OnLogin()
     if initDone then return end
     initDone = true
@@ -1183,9 +1505,26 @@ local function OnLogin()
     -- Seed combat state so we don't fire a spurious COMBAT_ENTERED on first tick
     wasInCombat = (UnitAffectingCombat and UnitAffectingCombat("player")) or false
 
+    -- Re-inject any previously generated profiles from SavedVariables
+    RestoreGeneratedProfiles()
+
+    -- Auto-select profile based on current class/spec
+    DetectProfile()
+
+    -- GetSpecialization() sometimes returns nil at PLAYER_LOGIN.
+    -- Re-run detection after 3s to catch the common case where spec loads late.
+    C_Timer.After(3, function()
+        if not Core.activeProfile then
+            local p = DetectProfile()
+            if p then
+                U().Print("Profile detected (late load): " .. p.name)
+            end
+        end
+    end)
+
+    local profileName = Core.activeProfile and Core.activeProfile.name or "generic"
     U().Print(string.format("v%s loaded. Profile: %s | Type /mtdt help for commands.",
-        Core.VERSION,
-        Core.activeProfile and Core.activeProfile.name or "generic"))
+        Core.VERSION, profileName))
 end
 
 -- Initialization entry point

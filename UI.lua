@@ -144,7 +144,7 @@ local contentText   = nil
 local activeTab     = "controls"
 local statusTimer   = 0   -- used by OnUpdate to refresh the live timer
 
-local PANEL_W = 380
+local PANEL_W = 420
 local PANEL_H = 480
 local TAB_H   = 26
 local CONTENT_TOP_OFFSET = 26 + 28 + TAB_H + 6   -- titlebar + status + tabs + padding
@@ -208,29 +208,79 @@ end
 -- Tab: Controls
 --------------------------------------------------------------------------------
 local function RenderControls()
-    local isRec = Core()._IsRecording and Core()._IsRecording() or false
-    local db    = MidnightTimDebugDB
-    local n     = db and db.sessions and #db.sessions or 0
-    local profile = Core().activeProfile and Core().activeProfile.name or "generic"
+    local db      = MidnightTimDebugDB
+    local n       = db and db.sessions and #db.sessions or 0
+    local ap      = Core().activeProfile
+    local profile = ap and ap.name or "generic"
+    local isGenerated = ap and ap.generated or false
+
+    local dumpCount = db and db.spellDump and #db.spellDump or 0
+    local dumpClass = db and db.spellDumpClass
+    local dumpWall  = db and db.spellDumpTime
+
+    local profileLines = {}
+    local seenNames    = {}
+    local profiles = Core().WATCH_PROFILES or {}
+    for _, p in pairs(profiles) do
+        local tag    = p.generated and " [generated]" or ""
+        local active = (ap == p) and " <active>" or ""
+        local entry  = "  " .. (p.name or "?") .. tag .. active
+        -- Deduplicate: if same name exists without <active>, replace it
+        if not seenNames[p.name] then
+            seenNames[p.name] = true
+            table.insert(profileLines, entry)
+        elseif active ~= "" then
+            -- Active version wins -- find and replace the non-active duplicate
+            for i, existing in ipairs(profileLines) do
+                if existing:find(p.name, 1, true) and not existing:find("<active>") then
+                    table.remove(profileLines, i)
+                    break
+                end
+            end
+            table.insert(profileLines, entry)
+        end
+    end
+    table.sort(profileLines)
+    table.insert(profileLines, "  generic (auto fallback)")
 
     local lines = {
         Clr("9966ff", "RECORD"),
         "",
-        "Profile: " .. Clr("dddddd", profile),
-        "Sessions saved: " .. Clr("dddddd", tostring(n)),
-        "Poll interval: " .. Clr("dddddd", string.format("%.2fs", Core().POLL_INTERVAL or 0.1)),
+        "Profile:      " .. Clr(isGenerated and "ffaa00" or "dddddd", profile),
+        "Sessions:     " .. Clr("dddddd", tostring(n)),
+        "Poll:         " .. Clr("dddddd", string.format("%.2fs interval", Core().POLL_INTERVAL or 0.1)),
         "",
-        Clr("9966ff", "EXPORT"),
-        "",
-        Clr("888888", "Exports write to:"),
-        Clr("aaaaaa", "MidnightTimDebugDB.meta.lastExportCSV"),
-        Clr("888888", "Open SavedVariables file after /reload"),
-        "",
-        Clr("9966ff", "PROFILES"),
-        "",
-        "  devourer  -  Devourer DH (primary target)",
-        "  none      -  Generic (all spells/auras)",
     }
+
+    if dumpCount > 0 and dumpClass then
+        local wall = (dumpWall and date) and date("%b %d %H:%M", dumpWall) or "?"
+        table.insert(lines, Clr("9966ff", "SPELL DUMP"))
+        table.insert(lines, "")
+        table.insert(lines, string.format("  %s %s  --  %d spells  --  %s",
+            dumpClass.specName or "?", dumpClass.className or "?", dumpCount, wall))
+        if isGenerated then
+            table.insert(lines, Clr("22dd22", "  Profile built and active."))
+        else
+            table.insert(lines, Clr("ffaa00", "  Run Dump Spells again to rebuild profile."))
+        end
+        table.insert(lines, "")
+    else
+        table.insert(lines, Clr("888888", "No spell dump yet."))
+        table.insert(lines, Clr("888888", "Click Dump Spells (Commands tab) to build a profile."))
+        table.insert(lines, "")
+    end
+
+    table.insert(lines, Clr("9966ff", "PROFILES"))
+    table.insert(lines, "")
+    for _, pl in ipairs(profileLines) do table.insert(lines, pl) end
+    table.insert(lines, "")
+    table.insert(lines, Clr("888888", "Auto-detects on login. /mtdt profile auto to re-detect."))
+    table.insert(lines, Clr("888888", "/mtdt profile clear removes generated profiles."))
+    table.insert(lines, "")
+    table.insert(lines, Clr("9966ff", "EXPORT"))
+    table.insert(lines, "")
+    table.insert(lines, Clr("888888", "MidnightTimDebugDB.meta.lastExportCSV"))
+    table.insert(lines, Clr("888888", "Open SavedVariables file after /reload"))
     SetContent(table.concat(lines, "\n"))
 end
 
@@ -390,6 +440,54 @@ local function RenderInfo()
 end
 
 --------------------------------------------------------------------------------
+-- Tab: Commands
+-- All slash commands shown as clickable buttons. Clicking runs the command.
+-- Replaces the need to scroll through chat output for every /mtdt operation.
+--------------------------------------------------------------------------------
+local COMMANDS = {
+    { label = "Start Recording",    cmd = "start",          desc = "Manual session start"              },
+    { label = "Stop Recording",     cmd = "stop",           desc = "End current session"               },
+    { label = "Status",             cmd = "status",         desc = "Show recorder state in chat"       },
+    { label = "Sessions List",      cmd = "sessions",       desc = "List last 10 saved sessions"       },
+    { label = "Export Recent",      cmd = "export recent",  desc = "Export most recent session to CSV" },
+    { label = "Export Last 10",     cmd = "export last10",  desc = "Export last 10 sessions"           },
+    { label = "Export All",         cmd = "export all",     desc = "Export all sessions"               },
+    { label = "Snapshot",           cmd = "snapshot",       desc = "Live spell usability table"        },
+    { label = "Auras",              cmd = "auras",          desc = "Print current player auras"        },
+    { label = "Talents",            cmd = "talents",        desc = "Print active talents"              },
+    { label = "API Check",          cmd = "apicheck",       desc = "Probe which APIs are available"    },
+    { label = "Build Profile",      cmd = "buildprofile",   desc = "Dump spells + talents, build watch profile, prompt reload" },
+    { label = "Spell List",         cmd = "spelllist",      desc = "Open spell dump in copy-paste box" },
+    { label = "Talent List",        cmd = "talentlist",     desc = "Open talent dump in copy-paste box"},
+    { label = "Profile: Auto",      cmd = "profile auto",   desc = "Re-detect profile from class/spec" },
+    { label = "Profile: Devourer",  cmd = "profile devourer", desc = "Force Devourer DH profile"      },
+    { label = "Profile: Generic",   cmd = "profile none",   desc = "Generic mode, no watch list"       },
+    { label = "Reset All Data",     cmd = "reset",          desc = "Discard session + clear all data"  },
+}
+
+local function RenderCommands()
+    local db        = MidnightTimDebugDB
+    local dumpTime  = db and db.meta and db.spellDump and db.spellDumpTime
+    local dumpCount = db and db.spellDump and #db.spellDump or 0
+
+    local lines = {
+        Clr("9966ff", "COMMANDS"),
+        "",
+        Clr("888888", "Click any button to run the command."),
+        Clr("888888", "Results appear in chat. /mtdt help for full reference."),
+        "",
+    }
+    if dumpCount > 0 then
+        local wall = dumpTime and date and date("%H:%M", dumpTime) or "?"
+        table.insert(lines, Clr("22dd22", string.format("Spell dump: %d spells captured at %s", dumpCount, wall)))
+        table.insert(lines, Clr("888888", "Type /reload to persist to SavedVariables."))
+        table.insert(lines, "")
+    end
+    table.insert(lines, Clr("888888", "(Use the buttons below -- rendered as interactive buttons in panel)"))
+    SetContent(table.concat(lines, "\n"))
+end
+
+--------------------------------------------------------------------------------
 -- Tab dispatcher
 --------------------------------------------------------------------------------
 local tabRenders = {
@@ -397,6 +495,7 @@ local tabRenders = {
     sessions = RenderSessions,
     snapshot = RenderSnapshot,
     info     = RenderInfo,
+    commands = RenderCommands,
 }
 
 local tabButtons = {}
@@ -411,6 +510,12 @@ local function SwitchTab(name)
             btn:SetBackdropColor(C.BG_LIGHT[1], C.BG_LIGHT[2], C.BG_LIGHT[3], C.BG_LIGHT[4] or 1)
             btn.label:SetTextColor(C.TEXT[1], C.TEXT[2], C.TEXT[3], 1)
         end
+    end
+    -- Toggle between normal scroll content and command buttons pane
+    if panel then
+        local isCmd = (name == "commands")
+        if contentScroll then contentScroll:SetShown(not isCmd) end
+        if panel.cmdPane  then panel.cmdPane:SetShown(isCmd)    end
     end
     RefreshStatus()
     local fn = tabRenders[name]
@@ -440,9 +545,27 @@ local function BuildPanel()
     statusRow:SetHeight(28)
     ApplyBackdrop(statusRow, {0.06, 0.06, 0.10, 0.95}, C.BORDER)
 
+    -- Build Profile button (right side of status row)
+    local btnBuild = MakeButton(statusRow, 90, 22, "Build Profile", true)
+    btnBuild:SetPoint("RIGHT", statusRow, "RIGHT", -4, 0)
+    btnBuild:SetScript("OnClick", function()
+        SlashCmdList["MIDNIGHTTIMDEBUGGINGTOOLS"]("buildprofile")
+    end)
+    btnBuild:SetScript("OnEnter", function(self)
+        self:SetBackdropColor(C.ROW_HOVER[1], C.ROW_HOVER[2], C.ROW_HOVER[3], 0.9)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOMRIGHT")
+        GameTooltip:SetText("Build Profile", 1, 1, 1, 1, true)
+        GameTooltip:AddLine("Dumps spells + talents for your\ncurrent spec and builds a watch\nprofile. Prompts for reload.", 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+    end)
+    btnBuild:SetScript("OnLeave", function(self)
+        self:SetBackdropColor(C.BG_LIGHT[1], C.BG_LIGHT[2], C.BG_LIGHT[3], C.BG_LIGHT[4] or 1)
+        GameTooltip:Hide()
+    end)
+
     statusLabel = MakeFont(statusRow, 10, "LEFT")
     statusLabel:SetPoint("LEFT",  statusRow, "LEFT",  8, 0)
-    statusLabel:SetPoint("RIGHT", statusRow, "RIGHT", -8, 0)
+    statusLabel:SetPoint("RIGHT", btnBuild,  "LEFT",  -4, 0)
     statusLabel:SetText("Initializing...")
 
     -- Tab row
@@ -457,6 +580,7 @@ local function BuildPanel()
         { key = "sessions", label = "Sessions" },
         { key = "snapshot", label = "Snapshot" },
         { key = "info",     label = "Info"     },
+        { key = "commands", label = "Commands" },
     }
     local tabW = math.floor(PANEL_W / #tabDefs)
     for i, td in ipairs(tabDefs) do
@@ -481,6 +605,62 @@ local function BuildPanel()
     contentText:SetPoint("TOPRIGHT", contentFrame, "TOPRIGHT", -4, -4)
     contentText:SetWordWrap(true)
     contentText:SetSpacing(3)
+
+    -- Command buttons pane (visible only on Commands tab)
+    -- Replaces contentScroll when active -- two-column grid of clickable buttons
+    local cmdPane = CreateFrame("ScrollFrame", nil, panel, "UIPanelScrollFrameTemplate")
+    cmdPane:SetPoint("TOPLEFT",     panel, "TOPLEFT",   8,  -(26 + 28 + TAB_H + 6))
+    cmdPane:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -26, 34)
+    local cmdInner = CreateFrame("Frame", nil, cmdPane)
+    cmdInner:SetWidth(cmdPane:GetWidth())
+    cmdPane:SetScrollChild(cmdInner)
+    cmdPane:Hide()
+    panel.cmdPane = cmdPane
+
+    local COLS      = 2
+    local BTN_W     = math.floor((PANEL_W - 36) / COLS)
+    local BTN_H     = 24
+    local BTN_PAD   = 3
+    local totalBtns = #COMMANDS
+    local rows      = math.ceil(totalBtns / COLS)
+    cmdInner:SetHeight(rows * (BTN_H + BTN_PAD) + 8)
+
+    for idx, def in ipairs(COMMANDS) do
+        local col = (idx - 1) % COLS
+        local row = math.floor((idx - 1) / COLS)
+        local x   = col * (BTN_W + BTN_PAD) + 4
+        local y   = -(row * (BTN_H + BTN_PAD) + 4)
+
+        -- Highlight Reset differently
+        local isDestructive = (def.cmd == "reset")
+        local btn = MakeButton(cmdInner, BTN_W, BTN_H, def.label,
+            not isDestructive)  -- accent border on non-destructive
+        if isDestructive then
+            ApplyBackdrop(btn, {0.15, 0.04, 0.04, 0.90}, C.BORDER)
+        end
+        btn:SetPoint("TOPLEFT", cmdInner, "TOPLEFT", x, y)
+
+        -- Tooltip on hover
+        btn:SetScript("OnEnter", function(self)
+            self:SetBackdropColor(C.ROW_HOVER[1], C.ROW_HOVER[2], C.ROW_HOVER[3], 0.9)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("/mtdt " .. def.cmd, 1, 1, 1, 1, true)
+            GameTooltip:AddLine(def.desc, 0.7, 0.7, 0.7, true)
+            GameTooltip:Show()
+        end)
+        btn:SetScript("OnLeave", function(self)
+            self:SetBackdropColor(C.BG_LIGHT[1], C.BG_LIGHT[2], C.BG_LIGHT[3], C.BG_LIGHT[4] or 1)
+            GameTooltip:Hide()
+        end)
+
+        btn:SetScript("OnClick", function()
+            SlashCmdList["MIDNIGHTTIMDEBUGGINGTOOLS"](def.cmd)
+            -- Refresh commands tab after a short delay so status updates
+            C_Timer.After(0.3, function()
+                if activeTab == "commands" then RenderCommands() end
+            end)
+        end)
+    end
 
     -- Bottom bar with action buttons
     local botBar = CreateFrame("Frame", nil, panel, "BackdropTemplate")
@@ -687,6 +867,62 @@ end
 
 function UI.Hide()
     if panel then panel:Hide() end
+end
+
+--------------------------------------------------------------------------------
+-- Reload prompt
+-- Shown after a spell dump so the player knows they need to /reload to persist
+-- the generated profile and spell data to SavedVariables.
+-- Two buttons: Reload Now (calls ReloadUI) and Not Now (dismisses).
+--------------------------------------------------------------------------------
+local reloadPrompt = nil
+
+function UI.ShowReloadPrompt()
+    if not reloadPrompt then
+        reloadPrompt = CreateFrame("Frame", "MTDTReloadPrompt", UIParent, "BackdropTemplate")
+        reloadPrompt:SetSize(320, 130)
+        -- Position above the main panel if it exists, otherwise screen center
+        if panel and panel:IsShown() then
+            reloadPrompt:SetPoint("BOTTOM", panel, "TOP", 0, 8)
+        else
+            reloadPrompt:SetPoint("CENTER", UIParent, "CENTER", 0, 200)
+        end
+        reloadPrompt:SetFrameStrata("FULLSCREEN_DIALOG")
+        reloadPrompt:SetMovable(true)
+        reloadPrompt:SetClampedToScreen(true)
+        reloadPrompt:EnableMouse(true)
+        ApplyBackdrop(reloadPrompt, C.BG, C.BORDER_ACC)
+        MakeTitleBar(reloadPrompt, "MidnightTim Debug Tools -- Spell Dump Complete")
+
+        local msg1 = MakeFont(reloadPrompt, 11, "CENTER")
+        msg1:SetPoint("TOPLEFT",  reloadPrompt, "TOPLEFT",  10, -34)
+        msg1:SetPoint("TOPRIGHT", reloadPrompt, "TOPRIGHT", -10, -34)
+        msg1:SetText("Spell dump saved and profile built.")
+        msg1:SetTextColor(C.GREEN[1], C.GREEN[2], C.GREEN[3], 1)
+
+        local msg2 = MakeFont(reloadPrompt, 10, "CENTER")
+        msg2:SetPoint("TOPLEFT",  reloadPrompt, "TOPLEFT",  10, -52)
+        msg2:SetPoint("TOPRIGHT", reloadPrompt, "TOPRIGHT", -10, -52)
+        msg2:SetText("Reload to persist to SavedVariables.\nProfile is already active this session.")
+        msg2:SetTextColor(C.TEXT_DIM[1], C.TEXT_DIM[2], C.TEXT_DIM[3], 1)
+        msg2:SetWordWrap(true)
+
+        local btnReload = MakeButton(reloadPrompt, 120, 26, "Reload Now", true)
+        btnReload:SetPoint("BOTTOMLEFT", reloadPrompt, "BOTTOMLEFT", 16, 10)
+        btnReload:SetScript("OnClick", function()
+            reloadPrompt:Hide()
+            ReloadUI()
+        end)
+        btnReload.label:SetTextColor(C.GREEN[1], C.GREEN[2], C.GREEN[3], 1)
+
+        local btnLater = MakeButton(reloadPrompt, 120, 26, "Not Now")
+        btnLater:SetPoint("BOTTOMRIGHT", reloadPrompt, "BOTTOMRIGHT", -16, 10)
+        btnLater:SetScript("OnClick", function()
+            reloadPrompt:Hide()
+            U().Print("Profile active this session. Type /reload when ready to persist.")
+        end)
+    end
+    reloadPrompt:Show()
 end
 
 --------------------------------------------------------------------------------

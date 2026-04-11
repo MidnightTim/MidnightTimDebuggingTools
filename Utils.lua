@@ -81,6 +81,11 @@ end
 --------------------------------------------------------------------------------
 function U.Str(v)
     if v == nil then return "nil" end
+    -- For numbers, check they're not secret before converting
+    if type(v) == "number" then
+        local ok = pcall(function() return v + 0 end)
+        if not ok then return "<secret>" end
+    end
     local ok, result = pcall(tostring, v)
     if ok then return result end
     return "<secret>"
@@ -95,11 +100,23 @@ end
 
 -- Sanitize a value for storage: replaces secret userdatas with nil
 -- so they never end up in session tables or CSV output.
+-- Midnight 12.0 secret numbers: tostring() succeeds but comparison operators
+-- (<, >, ==) throw "attempt to compare secret number". We must probe with
+-- tonumber() for numeric values, and also guard the type() call itself.
 function U.Sanitize(v)
     if v == nil then return nil end
-    local ok, result = pcall(tostring, v)
-    if ok then return v end   -- original value is fine, return as-is
-    return nil                -- secret -- drop it
+    -- Check type safely -- type() itself is safe on secrets
+    local t = type(v)
+    if t == "number" then
+        -- For numbers, probe whether arithmetic works (secrets throw on any op)
+        local ok = pcall(function() return v + 0 end)
+        if not ok then return nil end
+        return v
+    end
+    -- For non-numbers, probe tostring
+    local ok = pcall(tostring, v)
+    if ok then return v end
+    return nil
 end
 
 --------------------------------------------------------------------------------
@@ -239,12 +256,14 @@ function U.SnapshotAuras(unit)
                 local ok, data = pcall(C_UnitAuras.GetAuraDataByIndex, unit, i, filter)
                 if not ok or not data then break end
                 local sid = U.Sanitize(data.spellId)
-                if sid and sid > 0 then
+                -- sid must be a real number we can compare -- secret numbers
+                -- pass tostring but throw on > comparison, so check type too
+                if sid and type(sid) == "number" and sid > 0 then
                     local key = tostring(sid) .. (filter == "HARMFUL" and "_h" or "_b")
                     auras[key] = {
                         spellID        = sid,
-                        name           = data.name or U.GetSpellName(sid),
-                        stacks         = data.applications or 0,
+                        name           = U.Sanitize(data.name) or U.GetSpellName(sid),
+                        stacks         = U.Sanitize(data.applications) or 0,
                         duration       = U.Sanitize(data.duration),
                         expirationTime = U.Sanitize(data.expirationTime),
                         auraType       = filter,
@@ -325,8 +344,14 @@ function U.DiffAuras(before, after)
     for k, v in pairs(after) do
         if not before[k] then
             added[k] = v
-        elseif before[k].stacks ~= v.stacks then
-            changed[k] = { from = before[k].stacks, to = v.stacks, spell = v }
+        else
+            -- Guard stacks comparison -- secret numbers throw on ~=
+            local ok, different = pcall(function()
+                return before[k].stacks ~= v.stacks
+            end)
+            if ok and different then
+                changed[k] = { from = before[k].stacks, to = v.stacks, spell = v }
+            end
         end
     end
     for k, v in pairs(before) do
@@ -519,8 +544,15 @@ end
 -- Class / spec info
 --------------------------------------------------------------------------------
 function U.SnapshotClassSpec()
-    local className, classTag, classID = U.Safe(UnitClass, "player")
-    local specIdx   = U.Safe(GetSpecialization)
+    -- UnitClass returns (localizedName, classTag, classID) -- need all three.
+    -- U.Safe only returns the first value, so we use a pcall wrapper here.
+    local className, classTag, classID
+    local ok = pcall(function()
+        className, classTag, classID = UnitClass("player")
+    end)
+    if not ok then className, classTag, classID = nil, nil, nil end
+
+    local specIdx = U.Safe(GetSpecialization)
     local specID, specName
 
     if GetSpecializationInfo and specIdx then
@@ -528,12 +560,12 @@ function U.SnapshotClassSpec()
     end
 
     return {
-        className = className,
-        classTag  = classTag,
-        classID   = classID,
-        specIdx   = specIdx,
-        specID    = specID,
-        specName  = specName,
+        className  = className,
+        classTag   = classTag,
+        classID    = classID,
+        specIdx    = specIdx,
+        specID     = specID,
+        specName   = specName,
         playerName = U.Safe(UnitName, "player"),
         realmName  = U.Safe(GetRealmName),
     }
